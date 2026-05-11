@@ -41,6 +41,7 @@ def init_db():
                 contact_name TEXT,
                 contact_email TEXT,
                 application_deadline TEXT,
+                performance_date TEXT,
                 status TEXT NOT NULL DEFAULT 'Recherche',
                 notes TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -53,6 +54,8 @@ def init_db():
         }
         if "owner" not in columns:
             connection.execute("ALTER TABLE opportunities ADD COLUMN owner TEXT")
+        if "performance_date" not in columns:
+            connection.execute("ALTER TABLE opportunities ADD COLUMN performance_date TEXT")
 
 
 def normalize_url(value):
@@ -76,6 +79,7 @@ def form_data(form):
         "contact_name": field_value(form, "contact_name"),
         "contact_email": field_value(form, "contact_email"),
         "application_deadline": field_value(form, "application_deadline"),
+        "performance_date": field_value(form, "performance_date"),
         "status": field_value(form, "status") or "Recherche",
         "notes": field_value(form, "notes"),
     }
@@ -91,10 +95,10 @@ def save_opportunity(form):
             """
             INSERT INTO opportunities (
                 name, kind, city, website, owner, contact_name, contact_email,
-                application_deadline, status, notes
+                application_deadline, performance_date, status, notes
             ) VALUES (
                 :name, :kind, :city, :website, :owner, :contact_name, :contact_email,
-                :application_deadline, :status, :notes
+                :application_deadline, :performance_date, :status, :notes
             )
             """,
             data,
@@ -120,6 +124,7 @@ def update_opportunity(form):
                 contact_name = :contact_name,
                 contact_email = :contact_email,
                 application_deadline = :application_deadline,
+                performance_date = :performance_date,
                 status = :status,
                 notes = :notes
             WHERE id = :id
@@ -422,6 +427,13 @@ def render_page(message="", edit_row=None, filters=None):
                         <input name="application_deadline" type="date" value="{escape(row_field(edit_row, "application_deadline"))}">
                     </label>
                     <label>
+                        Auftrittsdatum
+                        <input name="performance_date" type="date" value="{escape(row_field(edit_row, "performance_date"))}">
+                    </label>
+                </div>
+
+                <div class="grid-two">
+                    <label>
                         Status
                         <select name="status">
                             {option("Recherche", status)}
@@ -476,6 +488,7 @@ def render_card(row):
         else ""
     )
     deadline = escape(row["application_deadline"] or "Keine Frist")
+    performance_date = escape(row["performance_date"] or "Noch offen")
     notes = escape(row["notes"] or "Noch keine Notizen")
     contact = escape(row["contact_name"] or "Kontakt offen")
     city_value = row["city"] or ""
@@ -500,6 +513,7 @@ def render_card(row):
         <dl class="meta">
             <div><dt>Ort</dt><dd>{city}{maps_link}</dd></div>
             <div><dt>Frist</dt><dd>{deadline}</dd></div>
+            <div><dt>Auftritt</dt><dd>{performance_date}</dd></div>
             <div><dt>Verantwortlich</dt><dd>{owner}</dd></div>
             <div><dt>Kontakt</dt><dd>{contact}</dd></div>
         </dl>
@@ -918,7 +932,7 @@ h3 {
 
 .meta {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 12px;
     margin: 18px 0;
 }
@@ -1011,9 +1025,9 @@ dd {
     }
 }
 
-@media (max-width: 700px) {
+@media (max-width: 780px) {
     .meta {
-        grid-template-columns: 1fr 1fr;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 }
 
