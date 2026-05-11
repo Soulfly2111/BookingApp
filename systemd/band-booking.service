@@ -1,0 +1,20 @@
+[Unit]
+Description=Die Bauern Booking Planner
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/band-booking
+Environment=BOOKING_HOST=127.0.0.1
+Environment=BOOKING_PORT=8000
+Environment=BOOKING_DB_PATH=/var/www/band-booking/data/band_concerts.db
+Environment=BOOKING_LOGO_PATH=/var/www/band-booking/assets/logo.png
+Environment=BOOKING_OPEN_BROWSER=0
+ExecStart=/var/www/band-booking/.venv/bin/python /var/www/band-booking/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
