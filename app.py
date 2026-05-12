@@ -446,6 +446,8 @@ def render_availability_section(filters):
                 """
             )
 
+    summary = render_availability_summary(availability_by_day)
+
     return f"""
     <section class="panel availability-panel tab-pane{active_class}" aria-labelledby="availability-calendar">
         <div class="section-heading dark-heading">
@@ -480,20 +482,84 @@ def render_availability_section(filters):
             <button type="submit">Zeit eintragen</button>
         </form>
 
-        <div class="calendar-grid calendar-weekdays">
-            <span>Mo</span>
-            <span>Di</span>
-            <span>Mi</span>
-            <span>Do</span>
-            <span>Fr</span>
-            <span>Sa</span>
-            <span>So</span>
-        </div>
-        <div class="calendar-grid">
-            {"".join(cells)}
+        <div class="calendar-layout">
+            <div class="calendar-view">
+                <div class="calendar-grid calendar-weekdays">
+                    <span>Mo</span>
+                    <span>Di</span>
+                    <span>Mi</span>
+                    <span>Do</span>
+                    <span>Fr</span>
+                    <span>Sa</span>
+                    <span>So</span>
+                </div>
+                <div class="calendar-grid">
+                    {"".join(cells)}
+                </div>
+            </div>
+            {summary}
         </div>
     </section>
     """
+
+
+def render_availability_summary(availability_by_day):
+    if not availability_by_day:
+        return """
+        <aside class="availability-summary" aria-label="Terminliste">
+            <h3>Terminliste</h3>
+            <p class="summary-empty">Noch keine Verfügbarkeiten in diesem Monat.</p>
+        </aside>
+        """
+
+    items = []
+    for day_key in sorted(availability_by_day):
+        rows = availability_by_day[day_key]
+        owners = sorted({row["owner"] for row in rows})
+        owner_names = ", ".join(owners)
+        all_available = {"Frank", "Michael", "Heiner"}.issubset(set(owners))
+        item_class = "summary-item all-available" if all_available else "summary-item"
+        notes = [
+            f'{escape(row["owner"])}: {escape(row["notes"])}'
+            for row in rows
+            if row["notes"]
+        ]
+        notes_html = (
+            f'<p class="summary-notes">{" | ".join(notes)}</p>'
+            if notes
+            else ""
+        )
+        badge_text = "Alle können" if all_available else f"{len(owners)} von 3"
+        formatted_date = format_date(day_key)
+        items.append(
+            f"""
+            <article class="{item_class}">
+                <div>
+                    <time datetime="{escape(day_key)}">{escape(formatted_date)}</time>
+                    <p>{escape(owner_names)}</p>
+                    {notes_html}
+                </div>
+                <span>{badge_text}</span>
+            </article>
+            """
+        )
+
+    return f"""
+    <aside class="availability-summary" aria-label="Terminliste">
+        <h3>Terminliste</h3>
+        <div class="summary-list">
+            {"".join(items)}
+        </div>
+    </aside>
+    """
+
+
+def format_date(value):
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        return parsed.strftime("%d.%m.%Y")
+    except ValueError:
+        return value
 
 
 def render_availability_entry(row):
@@ -1167,6 +1233,17 @@ button:hover,
     margin-bottom: 18px;
 }
 
+.calendar-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+    gap: 18px;
+    align-items: start;
+}
+
+.calendar-view {
+    min-width: 0;
+}
+
 .calendar-grid {
     display: grid;
     grid-template-columns: repeat(7, minmax(0, 1fr));
@@ -1262,6 +1339,78 @@ button:hover,
 
 .owner-heiner {
     background: #166534;
+}
+
+.availability-summary {
+    position: sticky;
+    top: 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    background: #f7f1e8;
+}
+
+.availability-summary h3 {
+    margin: 0 0 12px;
+}
+
+.summary-list {
+    display: grid;
+    gap: 10px;
+}
+
+.summary-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid #ded6c9;
+    border-radius: 8px;
+    padding: 12px;
+    background: #fffdf7;
+}
+
+.summary-item time {
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 900;
+}
+
+.summary-item p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.summary-item > span {
+    flex: 0 0 auto;
+    align-self: start;
+    border-radius: 999px;
+    padding: 6px 9px;
+    background: #111111;
+    color: #ffffff;
+    font-size: 0.76rem;
+    font-weight: 900;
+}
+
+.summary-item.all-available {
+    border-color: #16a34a;
+    background: #dcfce7;
+}
+
+.summary-item.all-available > span {
+    background: #166534;
+}
+
+.summary-notes {
+    margin-top: 7px !important;
+    color: #3d4d3f !important;
+    font-size: 0.8rem !important;
+}
+
+.summary-empty {
+    margin: 0;
+    color: var(--muted);
+    line-height: 1.5;
 }
 
 .section-heading {
@@ -1435,6 +1584,14 @@ dd {
 
     .availability-form button {
         grid-column: 1 / -1;
+    }
+
+    .calendar-layout {
+        grid-template-columns: 1fr;
+    }
+
+    .availability-summary {
+        position: static;
     }
 }
 
