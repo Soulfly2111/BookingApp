@@ -229,6 +229,22 @@ def list_availability(month_value):
     return by_day
 
 
+def list_all_availability():
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM availability
+            ORDER BY available_date, owner, created_at
+            """
+        ).fetchall()
+
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row["available_date"], []).append(row)
+    return by_day
+
+
 def is_valid_date(value):
     try:
         datetime.strptime(value, "%Y-%m-%d")
@@ -423,6 +439,7 @@ def render_availability_section(filters):
     month_value = f"{year:04d}-{month:02d}"
     month_name = f"{MONTH_NAMES[month]} {year}"
     availability_by_day = list_availability(month_value)
+    all_availability_by_day = list_all_availability()
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
 
     cells = []
@@ -446,7 +463,7 @@ def render_availability_section(filters):
                 """
             )
 
-    summary = render_availability_summary(availability_by_day)
+    summary = render_availability_summary(all_availability_by_day)
 
     return f"""
     <section class="panel availability-panel tab-pane{active_class}" aria-labelledby="availability-calendar">
@@ -507,8 +524,8 @@ def render_availability_summary(availability_by_day):
     if not availability_by_day:
         return """
         <aside class="availability-summary" aria-label="Terminliste">
-            <h3>Terminliste</h3>
-            <p class="summary-empty">Noch keine Verfügbarkeiten in diesem Monat.</p>
+            <h3>Terminliste gesamt</h3>
+            <p class="summary-empty">Noch keine Verfügbarkeiten eingetragen.</p>
         </aside>
         """
 
@@ -546,7 +563,7 @@ def render_availability_summary(availability_by_day):
 
     return f"""
     <aside class="availability-summary" aria-label="Terminliste">
-        <h3>Terminliste</h3>
+        <h3>Terminliste gesamt</h3>
         <div class="summary-list">
             {"".join(items)}
         </div>
