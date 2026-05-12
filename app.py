@@ -3,9 +3,11 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
+import calendar
 import os
 import sqlite3
 import webbrowser
+from datetime import date, datetime
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -18,6 +20,21 @@ LOGO_PATH = Path(
 )
 APP_HOST = os.environ.get("BOOKING_HOST", "127.0.0.1")
 APP_PORT = int(os.environ.get("BOOKING_PORT", "8000"))
+MONTH_NAMES = (
+    "",
+    "Januar",
+    "Februar",
+    "März",
+    "April",
+    "Mai",
+    "Juni",
+    "Juli",
+    "August",
+    "September",
+    "Oktober",
+    "November",
+    "Dezember",
+)
 
 
 def get_connection():
@@ -56,6 +73,17 @@ def init_db():
             connection.execute("ALTER TABLE opportunities ADD COLUMN owner TEXT")
         if "performance_date" not in columns:
             connection.execute("ALTER TABLE opportunities ADD COLUMN performance_date TEXT")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS availability (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner TEXT NOT NULL,
+                available_date TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 def normalize_url(value):
@@ -145,6 +173,84 @@ def delete_opportunity(form):
             (opportunity_id,),
         )
     return cursor.rowcount == 1
+
+
+def save_availability(form):
+    owner = field_value(form, "owner")
+    available_date = field_value(form, "available_date")
+    notes = field_value(form, "notes")
+    if owner not in ("Frank", "Michael", "Heiner") or not is_valid_date(available_date):
+        return False
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO availability (owner, available_date, notes)
+            VALUES (?, ?, ?)
+            """,
+            (owner, available_date, notes),
+        )
+    return True
+
+
+def delete_availability(form):
+    availability_id = field_value(form, "id")
+    if not availability_id.isdigit():
+        return False
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM availability WHERE id = ?",
+            (availability_id,),
+        )
+    return cursor.rowcount == 1
+
+
+def list_availability(month_value):
+    year, month = parse_month(month_value)
+    start = date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    end = date(year, month, last_day)
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM availability
+            WHERE available_date BETWEEN ? AND ?
+            ORDER BY available_date, owner, created_at
+            """,
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+
+    by_day = {}
+    for row in rows:
+        by_day.setdefault(row["available_date"], []).append(row)
+    return by_day
+
+
+def is_valid_date(value):
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def parse_month(value):
+    try:
+        parsed = datetime.strptime(value, "%Y-%m")
+        return parsed.year, parsed.month
+    except (TypeError, ValueError):
+        today = date.today()
+        return today.year, today.month
+
+
+def shift_month(year, month, offset):
+    month_index = (year * 12 + month - 1) + offset
+    shifted_year = month_index // 12
+    shifted_month = month_index % 12 + 1
+    return f"{shifted_year:04d}-{shifted_month:02d}"
 
 
 def get_opportunity(opportunity_id):
@@ -309,6 +415,98 @@ def render_filter_form(filters):
     """
 
 
+def render_availability_section(filters):
+    month_value = filter_value(filters, "month", date.today().strftime("%Y-%m"))
+    year, month = parse_month(month_value)
+    month_value = f"{year:04d}-{month:02d}"
+    month_name = f"{MONTH_NAMES[month]} {year}"
+    availability_by_day = list_availability(month_value)
+    weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
+
+    cells = []
+    for week in weeks:
+        for day in week:
+            day_key = day.isoformat()
+            is_other_month = day.month != month
+            entries = availability_by_day.get(day_key, [])
+            entry_html = "\n".join(render_availability_entry(row) for row in entries)
+            classes = "calendar-day"
+            if is_other_month:
+                classes += " muted-day"
+            if entries:
+                classes += " has-availability"
+            cells.append(
+                f"""
+                <div class="{classes}">
+                    <div class="day-number">{day.day}</div>
+                    <div class="availability-list">{entry_html}</div>
+                </div>
+                """
+            )
+
+    return f"""
+    <section class="panel availability-panel" aria-labelledby="availability-calendar">
+        <div class="section-heading dark-heading">
+            <div>
+                <p class="eyebrow">Band-Kalender</p>
+                <h2 id="availability-calendar">Verfügbarkeiten für Konzerte</h2>
+            </div>
+            <div class="calendar-nav">
+                <a class="cancel-link" href="/?month={shift_month(year, month, -1)}">Zurück</a>
+                <span class="calendar-month">{escape(month_name)}</span>
+                <a class="cancel-link" href="/?month={shift_month(year, month, 1)}">Weiter</a>
+            </div>
+        </div>
+
+        <form method="post" action="/availability/add" class="availability-form">
+            <label>
+                Verantwortlicher
+                <select name="owner" required>
+                    {option("Frank", "")}
+                    {option("Michael", "")}
+                    {option("Heiner", "")}
+                </select>
+            </label>
+            <label>
+                Datum
+                <input name="available_date" type="date" required>
+            </label>
+            <label>
+                Notiz
+                <input name="notes" placeholder="z. B. abends, ganzer Tag, nur Nähe Duisburg">
+            </label>
+            <button type="submit">Zeit eintragen</button>
+        </form>
+
+        <div class="calendar-grid calendar-weekdays">
+            <span>Mo</span>
+            <span>Di</span>
+            <span>Mi</span>
+            <span>Do</span>
+            <span>Fr</span>
+            <span>Sa</span>
+            <span>So</span>
+        </div>
+        <div class="calendar-grid">
+            {"".join(cells)}
+        </div>
+    </section>
+    """
+
+
+def render_availability_entry(row):
+    notes = escape(row["notes"] or "")
+    notes_html = f'<span class="availability-note">{notes}</span>' if notes else ""
+    return f"""
+    <form method="post" action="/availability/delete" class="availability-entry owner-{escape(row["owner"]).lower()}">
+        <input type="hidden" name="id" value="{escape(str(row["id"]))}">
+        <span>{escape(row["owner"])}</span>
+        {notes_html}
+        <button type="submit" title="Eintrag löschen">×</button>
+    </form>
+    """
+
+
 def render_page(message="", edit_row=None, filters=None):
     filters = filters or {}
     opportunities = list_opportunities(filters)
@@ -469,6 +667,7 @@ def render_page(message="", edit_row=None, filters=None):
             {empty_state}
             <div class="cards">{cards}</div>
         </section>
+        {render_availability_section(filters)}
     </main>
 </body>
 </html>"""
@@ -547,6 +746,8 @@ class BookingHandler(BaseHTTPRequestHandler):
                 "1": "Eintrag gespeichert.",
                 "updated": "Eintrag aktualisiert.",
                 "deleted": "Eintrag gelöscht.",
+                "availability": "Verfügbarkeit eingetragen.",
+                "availability-deleted": "Verfügbarkeit gelöscht.",
             }
             message = messages.get(query.get("saved", [""])[0], "")
             self.respond(render_page(message, filters=query), "text/html; charset=utf-8")
@@ -585,6 +786,21 @@ class BookingHandler(BaseHTTPRequestHandler):
                 self.redirect("/?saved=deleted")
                 return
             self.respond(render_page("Der Eintrag konnte nicht gelöscht werden."), "text/html; charset=utf-8")
+            return
+
+        if path == "/availability/add":
+            if save_availability(form):
+                month = field_value(form, "available_date")[:7]
+                self.redirect(f"/?saved=availability&month={month}")
+                return
+            self.respond(render_page("Die Verfügbarkeit konnte nicht gespeichert werden."), "text/html; charset=utf-8")
+            return
+
+        if path == "/availability/delete":
+            if delete_availability(form):
+                self.redirect("/?saved=availability-deleted")
+                return
+            self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden."), "text/html; charset=utf-8")
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -859,6 +1075,138 @@ button:hover,
     color: #fffdf7;
 }
 
+.availability-panel {
+    grid-column: 1 / -1;
+    padding: 22px;
+}
+
+.availability-panel .section-heading {
+    margin-bottom: 18px;
+}
+
+.availability-panel .section-heading h2 {
+    color: var(--panel-ink);
+}
+
+.calendar-nav {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.calendar-month {
+    min-width: 150px;
+    color: var(--panel-ink);
+    font-weight: 900;
+    text-align: center;
+}
+
+.availability-form {
+    display: grid;
+    grid-template-columns: minmax(140px, 0.8fr) minmax(150px, 0.8fr) minmax(220px, 1.4fr) auto;
+    gap: 12px;
+    align-items: end;
+    margin-bottom: 18px;
+}
+
+.calendar-grid {
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
+.calendar-weekdays {
+    overflow: hidden;
+    border: 1px solid #27221d;
+    border-bottom: 0;
+    border-radius: 8px 8px 0 0;
+    background: #111111;
+    color: #fffdf7;
+    font-size: 0.78rem;
+    font-weight: 900;
+    text-transform: uppercase;
+}
+
+.calendar-weekdays span {
+    padding: 10px;
+    text-align: center;
+}
+
+.calendar-day {
+    min-height: 122px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    padding: 9px;
+    background: #fffdf7;
+}
+
+.calendar-day:nth-child(7n + 1) {
+    border-left: 1px solid var(--line);
+}
+
+.muted-day {
+    background: #eee8de;
+    color: #8a8076;
+}
+
+.has-availability {
+    background: #fff8ef;
+}
+
+.day-number {
+    margin-bottom: 7px;
+    font-size: 0.82rem;
+    font-weight: 900;
+}
+
+.availability-list {
+    display: grid;
+    gap: 6px;
+}
+
+.availability-entry {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 6px;
+    align-items: center;
+    margin: 0;
+    border-radius: 6px;
+    padding: 7px;
+    color: #ffffff;
+    font-size: 0.78rem;
+    font-weight: 900;
+}
+
+.availability-entry button {
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    background: rgba(0, 0, 0, 0.28);
+}
+
+.availability-entry button:hover {
+    background: rgba(0, 0, 0, 0.46);
+}
+
+.availability-note {
+    grid-column: 1 / -1;
+    font-size: 0.74rem;
+    font-weight: 700;
+    opacity: 0.88;
+}
+
+.owner-frank {
+    background: #9f1239;
+}
+
+.owner-michael {
+    background: #1d4ed8;
+}
+
+.owner-heiner {
+    background: #166534;
+}
+
 .section-heading {
     display: flex;
     align-items: center;
@@ -1023,6 +1371,14 @@ dd {
     .filter-actions {
         grid-column: 1 / -1;
     }
+
+    .availability-form {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .availability-form button {
+        grid-column: 1 / -1;
+    }
 }
 
 @media (max-width: 780px) {
@@ -1057,6 +1413,20 @@ dd {
 
     .filter-actions {
         flex-direction: column;
+    }
+
+    .availability-form,
+    .calendar-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .calendar-weekdays {
+        display: none;
+    }
+
+    .calendar-day {
+        min-height: auto;
+        border-left: 1px solid var(--line);
     }
 
     .section-heading,
