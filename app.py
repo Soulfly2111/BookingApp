@@ -361,6 +361,7 @@ def render_filter_form(filters):
 
     return f"""
     <form method="get" action="/" class="filter-panel">
+        <input type="hidden" name="tab" value="concerts">
         <label>
             Suche
             <input name="q" value="{escape(q)}" placeholder="Name, Ort, Kontakt, Notiz">
@@ -409,13 +410,14 @@ def render_filter_form(filters):
         </label>
         <div class="filter-actions">
             <button type="submit">Anwenden</button>
-            <a class="cancel-link" href="/">Zurücksetzen</a>
+            <a class="cancel-link" href="/?tab=concerts">Zurücksetzen</a>
         </div>
     </form>
     """
 
 
 def render_availability_section(filters):
+    active_class = " active" if filter_value(filters, "tab", "concerts") == "calendar" else ""
     month_value = filter_value(filters, "month", date.today().strftime("%Y-%m"))
     year, month = parse_month(month_value)
     month_value = f"{year:04d}-{month:02d}"
@@ -445,16 +447,16 @@ def render_availability_section(filters):
             )
 
     return f"""
-    <section class="panel availability-panel" aria-labelledby="availability-calendar">
+    <section class="panel availability-panel tab-pane{active_class}" aria-labelledby="availability-calendar">
         <div class="section-heading dark-heading">
             <div>
                 <p class="eyebrow">Band-Kalender</p>
                 <h2 id="availability-calendar">Verfügbarkeiten für Konzerte</h2>
             </div>
             <div class="calendar-nav">
-                <a class="cancel-link" href="/?month={shift_month(year, month, -1)}">Zurück</a>
+                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, -1)}">Zurück</a>
                 <span class="calendar-month">{escape(month_name)}</span>
-                <a class="cancel-link" href="/?month={shift_month(year, month, 1)}">Weiter</a>
+                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, 1)}">Weiter</a>
             </div>
         </div>
 
@@ -500,6 +502,7 @@ def render_availability_entry(row):
     return f"""
     <form method="post" action="/availability/delete" class="availability-entry owner-{escape(row["owner"]).lower()}">
         <input type="hidden" name="id" value="{escape(str(row["id"]))}">
+        <input type="hidden" name="month" value="{escape(row["available_date"][:7])}">
         <span>{escape(row["owner"])}</span>
         {notes_html}
         <button type="submit" title="Eintrag löschen">×</button>
@@ -507,20 +510,37 @@ def render_availability_entry(row):
     """
 
 
+def render_tabs(active_tab):
+    concerts_class = "active" if active_tab == "concerts" else ""
+    calendar_class = "active" if active_tab == "calendar" else ""
+    return f"""
+    <nav class="tabs" aria-label="Hauptbereiche">
+        <a class="{concerts_class}" href="/?tab=concerts">Konzerteinträge</a>
+        <a class="{calendar_class}" href="/?tab=calendar">Kalender</a>
+    </nav>
+    """
+
+
 def render_page(message="", edit_row=None, filters=None):
     filters = filters or {}
+    active_tab = filter_value(filters, "tab", "concerts")
+    if active_tab not in ("concerts", "calendar"):
+        active_tab = "concerts"
+    if edit_row is not None:
+        active_tab = "concerts"
     opportunities = list_opportunities(filters)
     cards = "\n".join(render_card(row) for row in opportunities)
     is_editing = edit_row is not None
     form_title = "Eintrag bearbeiten" if is_editing else "Neue Möglichkeit eintragen"
     form_action = "/update" if is_editing else "/add"
     submit_label = "Änderungen speichern" if is_editing else "Eintrag speichern"
-    cancel_link = '<a class="cancel-link" href="/">Bearbeitung abbrechen</a>' if is_editing else ""
+    cancel_link = '<a class="cancel-link" href="/?tab=concerts">Bearbeitung abbrechen</a>' if is_editing else ""
     hidden_id = f'<input type="hidden" name="id" value="{escape(str(edit_row["id"]))}">' if is_editing else ""
 
     kind = row_field(edit_row, "kind", "Festival")
     owner = row_field(edit_row, "owner")
     status = row_field(edit_row, "status", "Recherche")
+    concert_tab_class = " active" if active_tab == "concerts" else ""
 
     empty_state_text = (
         "Keine Einträge passen zu diesen Filtern."
@@ -565,7 +585,8 @@ def render_page(message="", edit_row=None, filters=None):
     </header>
 
     <main class="layout">
-        <section class="panel form-panel" aria-labelledby="new-opportunity">
+        {render_tabs(active_tab)}
+        <section class="panel form-panel tab-pane{concert_tab_class}" aria-labelledby="new-opportunity">
             <h2 id="new-opportunity">{form_title}</h2>
             {safe_message}
             <form method="post" action="{form_action}" class="entry-form">
@@ -655,7 +676,7 @@ def render_page(message="", edit_row=None, filters=None):
             </form>
         </section>
 
-        <section class="opportunity-list" aria-labelledby="saved-opportunities">
+        <section class="opportunity-list tab-pane{concert_tab_class}" aria-labelledby="saved-opportunities">
             <div class="section-heading">
                 <div>
                     <p class="eyebrow">Gespeichert</p>
@@ -720,7 +741,7 @@ def render_card(row):
         <div class="actions">
             {website_link}
             {email_link}
-            <a class="link-button muted" href="/edit?id={row_id}">Bearbeiten</a>
+            <a class="link-button muted" href="/edit?id={row_id}&tab=concerts">Bearbeiten</a>
             <form method="post" action="/delete" class="inline-form">
                 <input type="hidden" name="id" value="{row_id}">
                 <button type="submit" class="danger-button" onclick="return confirm('Diesen Eintrag wirklich löschen?')">Löschen</button>
@@ -769,21 +790,21 @@ class BookingHandler(BaseHTTPRequestHandler):
 
         if path == "/add":
             if save_opportunity(form):
-                self.redirect("/?saved=1")
+                self.redirect("/?tab=concerts&saved=1")
                 return
             self.respond(render_page("Bitte mindestens einen Namen eintragen."), "text/html; charset=utf-8")
             return
 
         if path == "/update":
             if update_opportunity(form):
-                self.redirect("/?saved=updated")
+                self.redirect("/?tab=concerts&saved=updated")
                 return
             self.respond(render_page("Der Eintrag konnte nicht aktualisiert werden."), "text/html; charset=utf-8")
             return
 
         if path == "/delete":
             if delete_opportunity(form):
-                self.redirect("/?saved=deleted")
+                self.redirect("/?tab=concerts&saved=deleted")
                 return
             self.respond(render_page("Der Eintrag konnte nicht gelöscht werden."), "text/html; charset=utf-8")
             return
@@ -791,14 +812,16 @@ class BookingHandler(BaseHTTPRequestHandler):
         if path == "/availability/add":
             if save_availability(form):
                 month = field_value(form, "available_date")[:7]
-                self.redirect(f"/?saved=availability&month={month}")
+                self.redirect(f"/?tab=calendar&saved=availability&month={month}")
                 return
             self.respond(render_page("Die Verfügbarkeit konnte nicht gespeichert werden."), "text/html; charset=utf-8")
             return
 
         if path == "/availability/delete":
             if delete_availability(form):
-                self.redirect("/?saved=availability-deleted")
+                month = field_value(form, "month")
+                month_query = f"&month={month}" if month else ""
+                self.redirect(f"/?tab=calendar&saved=availability-deleted{month_query}")
                 return
             self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden."), "text/html; charset=utf-8")
             return
@@ -942,6 +965,40 @@ h1 {
     width: min(1180px, calc(100% - 32px));
     margin: 28px auto 52px;
     align-items: start;
+}
+
+.tabs {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 6px;
+    background: rgba(255, 253, 247, 0.10);
+    border: 1px solid rgba(255, 253, 247, 0.18);
+    border-radius: 8px;
+}
+
+.tabs a {
+    min-height: 44px;
+    border-radius: 6px;
+    padding: 11px 16px;
+    color: #fffdf7;
+    font-weight: 900;
+    text-decoration: none;
+}
+
+.tabs a:hover,
+.tabs a.active {
+    background: #fffdf7;
+    color: #15110f;
+}
+
+.tab-pane {
+    display: none;
+}
+
+.tab-pane.active {
+    display: block;
 }
 
 .panel,
