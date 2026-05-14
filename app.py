@@ -463,19 +463,20 @@ def render_availability_section(filters):
                 """
             )
 
+    month_list = render_month_availability_list(availability_by_day, month_name)
     summary = render_availability_summary(all_availability_by_day)
 
     return f"""
-    <section class="panel availability-panel tab-pane{active_class}" aria-labelledby="availability-calendar">
+    <section id="calendar" class="panel availability-panel tab-pane{active_class}" aria-labelledby="availability-calendar">
         <div class="section-heading dark-heading">
             <div>
                 <p class="eyebrow">Band-Kalender</p>
                 <h2 id="availability-calendar">Verfügbarkeiten für Konzerte</h2>
             </div>
             <div class="calendar-nav">
-                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, -1)}">Zurück</a>
+                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, -1)}#calendar">Zurück</a>
                 <span class="calendar-month">{escape(month_name)}</span>
-                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, 1)}">Weiter</a>
+                <a class="cancel-link" href="/?tab=calendar&month={shift_month(year, month, 1)}#calendar">Weiter</a>
             </div>
         </div>
 
@@ -501,6 +502,7 @@ def render_availability_section(filters):
 
         <div class="calendar-layout">
             <div class="calendar-view">
+                {month_list}
                 <div class="calendar-grid calendar-weekdays">
                     <span>Mo</span>
                     <span>Di</span>
@@ -510,13 +512,44 @@ def render_availability_section(filters):
                     <span>Sa</span>
                     <span>So</span>
                 </div>
-                <div class="calendar-grid">
+                <div class="calendar-grid month-grid">
                     {"".join(cells)}
                 </div>
             </div>
             {summary}
         </div>
     </section>
+    """
+
+
+def render_month_availability_list(availability_by_day, month_name):
+    if not availability_by_day:
+        return f"""
+        <div class="month-compact-list" aria-label="Verfügbarkeiten im Monat">
+            <h3>{escape(month_name)}</h3>
+            <p class="summary-empty">Keine Verfügbarkeiten in diesem Monat.</p>
+        </div>
+        """
+
+    items = []
+    for day_key in sorted(availability_by_day):
+        entries_html = "\n".join(render_availability_entry(row) for row in availability_by_day[day_key])
+        items.append(
+            f"""
+            <article class="month-compact-day">
+                <time datetime="{escape(day_key)}">{escape(format_date(day_key))}</time>
+                <div class="availability-list">{entries_html}</div>
+            </article>
+            """
+        )
+
+    return f"""
+    <div class="month-compact-list" aria-label="Verfügbarkeiten im Monat">
+        <h3>{escape(month_name)}</h3>
+        <div class="month-compact-days">
+            {"".join(items)}
+        </div>
+    </div>
     """
 
 
@@ -599,7 +632,7 @@ def render_tabs(active_tab):
     return f"""
     <nav class="tabs" aria-label="Hauptbereiche">
         <a class="{concerts_class}" href="/?tab=concerts">Konzerteinträge</a>
-        <a class="{calendar_class}" href="/?tab=calendar">Kalender</a>
+        <a class="{calendar_class}" href="/?tab=calendar#calendar">Kalender</a>
     </nav>
     """
 
@@ -895,7 +928,7 @@ class BookingHandler(BaseHTTPRequestHandler):
         if path == "/availability/add":
             if save_availability(form):
                 month = field_value(form, "available_date")[:7]
-                self.redirect(f"/?tab=calendar&saved=availability&month={month}")
+                self.redirect(f"/?tab=calendar&saved=availability&month={month}#calendar")
                 return
             self.respond(render_page("Die Verfügbarkeit konnte nicht gespeichert werden."), "text/html; charset=utf-8")
             return
@@ -904,7 +937,7 @@ class BookingHandler(BaseHTTPRequestHandler):
             if delete_availability(form):
                 month = field_value(form, "month")
                 month_query = f"&month={month}" if month else ""
-                self.redirect(f"/?tab=calendar&saved=availability-deleted{month_query}")
+                self.redirect(f"/?tab=calendar&saved=availability-deleted{month_query}#calendar")
                 return
             self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden."), "text/html; charset=utf-8")
             return
@@ -1295,6 +1328,32 @@ button:hover,
     border-left: 1px solid var(--line);
 }
 
+.month-compact-list {
+    display: none;
+}
+
+.month-compact-list h3 {
+    margin: 0 0 12px;
+}
+
+.month-compact-days {
+    display: grid;
+    gap: 10px;
+}
+
+.month-compact-day {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 12px;
+    background: #fffdf7;
+}
+
+.month-compact-day time {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: 900;
+}
+
 .muted-day {
     background: #eee8de;
     color: #8a8076;
@@ -1646,18 +1705,21 @@ dd {
         flex-direction: column;
     }
 
-    .availability-form,
-    .calendar-grid {
+    .availability-form {
         grid-template-columns: 1fr;
     }
 
-    .calendar-weekdays {
+    .month-compact-list {
+        display: block;
+    }
+
+    .calendar-weekdays,
+    .month-grid {
         display: none;
     }
 
-    .calendar-day {
-        min-height: auto;
-        border-left: 1px solid var(--line);
+    .calendar-layout {
+        gap: 14px;
     }
 
     .section-heading,
