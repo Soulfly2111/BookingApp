@@ -1,11 +1,17 @@
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from html import escape
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
+import base64
 import calendar
+import hashlib
+import hmac
 import os
+import secrets
 import sqlite3
+import time
 import webbrowser
 from datetime import date, datetime
 
@@ -20,6 +26,14 @@ LOGO_PATH = Path(
 )
 APP_HOST = os.environ.get("BOOKING_HOST", "127.0.0.1")
 APP_PORT = int(os.environ.get("BOOKING_PORT", "8000"))
+SESSION_COOKIE = "booking_session"
+SESSION_TTL_SECONDS = 60 * 60 * 12
+SESSIONS = {}
+DEFAULT_USERS = (
+    ("Frank", "user", "FrankStart2026!"),
+    ("Michael", "user", "MichaelStart2026!"),
+    ("Heiner", "admin", "HeinerAdmin2026!"),
+)
 MONTH_NAMES = (
     "",
     "Januar",
@@ -84,6 +98,109 @@ def init_db():
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL CHECK(role IN ('user', 'admin')),
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        for username, role, password in DEFAULT_USERS:
+            existing = connection.execute(
+                "SELECT id FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO users (username, role, password_hash)
+                    VALUES (?, ?, ?)
+                    """,
+                    (username, role, hash_password(password)),
+                )
+
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return f"pbkdf2_sha256${base64.b64encode(salt).decode()}${base64.b64encode(digest).decode()}"
+
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, salt_value, digest_value = stored_hash.split("$", 2)
+    except ValueError:
+        return False
+    if algorithm != "pbkdf2_sha256":
+        return False
+    try:
+        salt = base64.b64decode(salt_value)
+        expected = base64.b64decode(digest_value)
+    except ValueError:
+        return False
+    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 120_000)
+    return hmac.compare_digest(actual, expected)
+
+
+def authenticate_user(username, password):
+    with get_connection() as connection:
+        user = connection.execute(
+            "SELECT username, role, password_hash FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if user is None or not verify_password(password, user["password_hash"]):
+        return None
+    return {"username": user["username"], "role": user["role"]}
+
+
+def list_users():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT username, role, created_at
+            FROM users
+            ORDER BY CASE role WHEN 'admin' THEN 1 ELSE 2 END, username
+            """
+        ).fetchall()
+
+
+def create_session(user):
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "username": user["username"],
+        "role": user["role"],
+        "expires_at": time.time() + SESSION_TTL_SECONDS,
+    }
+    return token
+
+
+def get_session(token):
+    if not token:
+        return None
+    session = SESSIONS.get(token)
+    if session is None:
+        return None
+    if session["expires_at"] < time.time():
+        SESSIONS.pop(token, None)
+        return None
+    session["expires_at"] = time.time() + SESSION_TTL_SECONDS
+    return {"username": session["username"], "role": session["role"]}
+
+
+def delete_session(token):
+    if token:
+        SESSIONS.pop(token, None)
+
+
+def default_password_for(username):
+    for default_username, _, password in DEFAULT_USERS:
+        if default_username == username:
+            return password
+    return ""
 
 
 def normalize_url(value):
@@ -626,18 +743,142 @@ def render_availability_entry(row):
     """
 
 
-def render_tabs(active_tab):
+def render_tabs(active_tab, current_user=None):
     concerts_class = "active" if active_tab == "concerts" else ""
     calendar_class = "active" if active_tab == "calendar" else ""
+    admin_link = ""
+    if current_user and current_user["role"] == "admin":
+        admin_class = "active" if active_tab == "admin" else ""
+        admin_link = f'<a class="{admin_class}" href="/admin">Admin</a>'
     return f"""
     <nav class="tabs" aria-label="Hauptbereiche">
         <a class="{concerts_class}" href="/?tab=concerts">Konzerteinträge</a>
         <a class="{calendar_class}" href="/?tab=calendar#calendar">Kalender</a>
+        {admin_link}
     </nav>
     """
 
 
-def render_page(message="", edit_row=None, filters=None):
+def render_user_bar(current_user):
+    if not current_user:
+        return ""
+    role_label = "Admin" if current_user["role"] == "admin" else "User"
+    return f"""
+    <div class="user-bar">
+        <span>Angemeldet als <strong>{escape(current_user["username"])}</strong> ({role_label})</span>
+        <form method="post" action="/logout">
+            <button type="submit" class="link-button muted">Abmelden</button>
+        </form>
+    </div>
+    """
+
+
+def render_login_page(message=""):
+    safe_message = f'<p class="message">{escape(message)}</p>' if message else ""
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Login | Band Booking Planner</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main class="auth-layout">
+        <section class="panel auth-panel" aria-labelledby="login-title">
+            <img class="auth-logo" src="/logo.png" alt="Die Bauern Logo">
+            <p class="eyebrow">Die Bauern Booking</p>
+            <h1 id="login-title">Anmelden</h1>
+            <p class="intro">Bitte melde dich an, um Konzertchancen und Kalender zu sehen.</p>
+            {safe_message}
+            <form method="post" action="/login" class="entry-form">
+                <label>
+                    Benutzer
+                    <input name="username" required autocomplete="username" autofocus>
+                </label>
+                <label>
+                    Passwort
+                    <input name="password" type="password" required autocomplete="current-password">
+                </label>
+                <button type="submit">Einloggen</button>
+            </form>
+        </section>
+    </main>
+</body>
+</html>"""
+
+
+def render_admin_page(current_user, message=""):
+    rows = []
+    for user in list_users():
+        role_label = "Admin" if user["role"] == "admin" else "User"
+        default_password = default_password_for(user["username"])
+        rows.append(
+            f"""
+            <tr>
+                <td>{escape(user["username"])}</td>
+                <td>{role_label}</td>
+                <td><code>{escape(default_password)}</code></td>
+                <td>{escape(user["created_at"])}</td>
+            </tr>
+            """
+        )
+
+    safe_message = f'<p class="message">{escape(message)}</p>' if message else ""
+    return f"""<!doctype html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Admin | Band Booking Planner</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="hero-inner">
+            <img class="band-logo" src="/logo.png" alt="Die Bauern Logo">
+            <div class="hero-copy">
+                <p class="eyebrow">Die Bauern Booking</p>
+                <h1>Admin</h1>
+                <p class="intro">Benutzer und Rollen für den geschützten Bereich.</p>
+            </div>
+        </div>
+    </header>
+
+    <main class="layout">
+        {render_user_bar(current_user)}
+        {render_tabs("admin", current_user)}
+        <section class="panel admin-panel">
+            <div class="section-heading">
+                <div>
+                    <p class="eyebrow">Zugriff</p>
+                    <h2>Benutzerverwaltung</h2>
+                </div>
+            </div>
+            {safe_message}
+            <p class="admin-note">Diese Startpasswörter sind nur für die erste Anmeldung gedacht.</p>
+            <div class="table-wrap">
+                <table class="admin-table">
+                    <thead>
+                        <tr>
+                            <th>Benutzer</th>
+                            <th>Rolle</th>
+                            <th>Initiales Passwort</th>
+                            <th>Angelegt</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {"".join(rows)}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+</body>
+</html>"""
+
+
+def render_page(message="", edit_row=None, filters=None, current_user=None):
     filters = filters or {}
     active_tab = filter_value(filters, "tab", "concerts")
     if active_tab not in ("concerts", "calendar"):
@@ -701,7 +942,8 @@ def render_page(message="", edit_row=None, filters=None):
     </header>
 
     <main class="layout">
-        {render_tabs(active_tab)}
+        {render_user_bar(current_user)}
+        {render_tabs(active_tab, current_user)}
         <section class="panel form-panel tab-pane{concert_tab_class}" aria-labelledby="new-opportunity">
             <h2 id="new-opportunity">{form_title}</h2>
             {safe_message}
@@ -868,6 +1110,24 @@ def render_card(row):
 
 
 class BookingHandler(BaseHTTPRequestHandler):
+    def current_user(self):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+        token = morsel.value if morsel else ""
+        return get_session(token)
+
+    def current_session_token(self):
+        cookie = SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get(SESSION_COOKIE)
+        return morsel.value if morsel else ""
+
+    def require_login(self):
+        user = self.current_user()
+        if user is None:
+            self.redirect("/login")
+            return None
+        return user
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -878,6 +1138,18 @@ class BookingHandler(BaseHTTPRequestHandler):
         if path == "/logo.png":
             self.respond_file(LOGO_PATH, "image/png")
             return
+        if path == "/login":
+            if self.current_user() is not None:
+                self.redirect("/")
+                return
+            message = "Bitte erneut anmelden." if query.get("expired", [""])[0] else ""
+            self.respond(render_login_page(message), "text/html; charset=utf-8")
+            return
+
+        current_user = self.require_login()
+        if current_user is None:
+            return
+
         if path == "/":
             messages = {
                 "1": "Eintrag gespeichert.",
@@ -887,14 +1159,20 @@ class BookingHandler(BaseHTTPRequestHandler):
                 "availability-deleted": "Verfügbarkeit gelöscht.",
             }
             message = messages.get(query.get("saved", [""])[0], "")
-            self.respond(render_page(message, filters=query), "text/html; charset=utf-8")
+            self.respond(render_page(message, filters=query, current_user=current_user), "text/html; charset=utf-8")
             return
         if path == "/edit":
             edit_row = get_opportunity(query.get("id", [""])[0])
             if edit_row is None:
-                self.respond(render_page("Eintrag wurde nicht gefunden."), "text/html; charset=utf-8")
+                self.respond(render_page("Eintrag wurde nicht gefunden.", current_user=current_user), "text/html; charset=utf-8")
                 return
-            self.respond(render_page("Du bearbeitest diesen Eintrag.", edit_row), "text/html; charset=utf-8")
+            self.respond(render_page("Du bearbeitest diesen Eintrag.", edit_row, current_user=current_user), "text/html; charset=utf-8")
+            return
+        if path == "/admin":
+            if current_user["role"] != "admin":
+                self.send_error(HTTPStatus.FORBIDDEN)
+                return
+            self.respond(render_admin_page(current_user), "text/html; charset=utf-8")
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -904,25 +1182,42 @@ class BookingHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode("utf-8")
         form = parse_qs(body)
 
+        if path == "/login":
+            user = authenticate_user(field_value(form, "username"), field_value(form, "password"))
+            if user is None:
+                self.respond(render_login_page("Benutzername oder Passwort stimmt nicht."), "text/html; charset=utf-8")
+                return
+            self.redirect_with_session("/", create_session(user))
+            return
+
+        if path == "/logout":
+            delete_session(self.current_session_token())
+            self.redirect_clearing_session("/login")
+            return
+
+        current_user = self.require_login()
+        if current_user is None:
+            return
+
         if path == "/add":
             if save_opportunity(form):
                 self.redirect("/?tab=concerts&saved=1")
                 return
-            self.respond(render_page("Bitte mindestens einen Namen eintragen."), "text/html; charset=utf-8")
+            self.respond(render_page("Bitte mindestens einen Namen eintragen.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         if path == "/update":
             if update_opportunity(form):
                 self.redirect("/?tab=concerts&saved=updated")
                 return
-            self.respond(render_page("Der Eintrag konnte nicht aktualisiert werden."), "text/html; charset=utf-8")
+            self.respond(render_page("Der Eintrag konnte nicht aktualisiert werden.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         if path == "/delete":
             if delete_opportunity(form):
                 self.redirect("/?tab=concerts&saved=deleted")
                 return
-            self.respond(render_page("Der Eintrag konnte nicht gelöscht werden."), "text/html; charset=utf-8")
+            self.respond(render_page("Der Eintrag konnte nicht gelöscht werden.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         if path == "/availability/add":
@@ -930,7 +1225,7 @@ class BookingHandler(BaseHTTPRequestHandler):
                 month = field_value(form, "available_date")[:7]
                 self.redirect(f"/?tab=calendar&saved=availability&month={month}#calendar")
                 return
-            self.respond(render_page("Die Verfügbarkeit konnte nicht gespeichert werden."), "text/html; charset=utf-8")
+            self.respond(render_page("Die Verfügbarkeit konnte nicht gespeichert werden.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         if path == "/availability/delete":
@@ -939,7 +1234,7 @@ class BookingHandler(BaseHTTPRequestHandler):
                 month_query = f"&month={month}" if month else ""
                 self.redirect(f"/?tab=calendar&saved=availability-deleted{month_query}#calendar")
                 return
-            self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden."), "text/html; charset=utf-8")
+            self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -968,6 +1263,24 @@ class BookingHandler(BaseHTTPRequestHandler):
     def redirect(self, location):
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", location)
+        self.end_headers()
+
+    def redirect_with_session(self, location, token):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}",
+        )
+        self.end_headers()
+
+    def redirect_clearing_session(self, location):
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", location)
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0",
+        )
         self.end_headers()
 
     def log_message(self, format, *args):
@@ -1081,6 +1394,43 @@ h1 {
     width: min(1180px, calc(100% - 32px));
     margin: 28px auto 52px;
     align-items: start;
+}
+
+.auth-layout {
+    display: grid;
+    min-height: 100vh;
+    place-items: center;
+    padding: 28px;
+}
+
+.auth-panel {
+    width: min(100%, 440px);
+}
+
+.auth-logo {
+    display: block;
+    width: 132px;
+    aspect-ratio: 1;
+    object-fit: contain;
+    margin: 0 0 22px;
+    border-radius: 8px;
+    background: #000000;
+}
+
+.user-bar {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    border: 1px solid rgba(255, 253, 247, 0.18);
+    border-radius: 8px;
+    padding: 12px;
+    background: rgba(255, 253, 247, 0.08);
+}
+
+.user-bar form {
+    margin: 0;
 }
 
 .tabs {
@@ -1229,6 +1579,41 @@ button:hover,
 
 .danger-button:hover {
     background: var(--danger-dark);
+}
+
+.admin-note {
+    color: var(--muted);
+    line-height: 1.55;
+}
+
+.table-wrap {
+    overflow-x: auto;
+}
+
+.admin-table {
+    width: 100%;
+    border-collapse: collapse;
+    color: var(--panel-ink);
+}
+
+.admin-table th,
+.admin-table td {
+    border-bottom: 1px solid var(--line);
+    padding: 12px;
+    text-align: left;
+    vertical-align: top;
+}
+
+.admin-table th {
+    font-size: 0.82rem;
+    text-transform: uppercase;
+}
+
+.admin-table code {
+    border-radius: 6px;
+    padding: 4px 7px;
+    background: #efe7dc;
+    color: #16110d;
 }
 
 .message {
@@ -1702,6 +2087,11 @@ dd {
     }
 
     .filter-actions {
+        flex-direction: column;
+    }
+
+    .user-bar {
+        align-items: flex-start;
         flex-direction: column;
     }
 
