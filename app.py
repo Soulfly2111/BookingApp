@@ -8,10 +8,14 @@ import base64
 import calendar
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import sqlite3
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import webbrowser
 from datetime import date, datetime
 
@@ -49,6 +53,18 @@ MONTH_NAMES = (
     "November",
     "Dezember",
 )
+LOCATION_CATEGORIES = {
+    "bar": "Bar",
+    "pub": "Kneipe",
+    "biergarten": "Biergarten",
+    "cafe": "Cafe",
+    "community_centre": "Jugendheim/Kulturzentrum",
+    "events_venue": "Veranstaltungsort",
+    "theatre": "Theater",
+    "music_venue": "Musikclub",
+    "nightclub": "Club",
+    "restaurant": "Restaurant",
+}
 
 
 def get_connection():
@@ -122,6 +138,24 @@ def init_db():
                     """,
                     (username, role, hash_password(password)),
                 )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorite_locations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                osm_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                category TEXT,
+                address TEXT,
+                website TEXT,
+                lat REAL,
+                lon REAL,
+                genre_hint TEXT,
+                capacity_hint TEXT,
+                info TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 def hash_password(password):
@@ -470,6 +504,229 @@ def list_opportunities(filters=None):
         ).fetchall()
 
 
+def http_json(url, data=None, timeout=12):
+    headers = {
+        "User-Agent": "DieBauernBookingApp/1.0 (location research)",
+        "Accept": "application/json",
+    }
+    body = data.encode("utf-8") if data is not None else None
+    request = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def geocode_place(place):
+    query = urllib.parse.urlencode(
+        {
+            "q": place,
+            "format": "json",
+            "limit": "1",
+            "addressdetails": "1",
+            "countrycodes": "de",
+        }
+    )
+    results = http_json(f"https://nominatim.openstreetmap.org/search?{query}")
+    if not results:
+        return None
+    result = results[0]
+    return {
+        "label": result.get("display_name", place),
+        "lat": float(result["lat"]),
+        "lon": float(result["lon"]),
+    }
+
+
+def overpass_location_search(lat, lon, radius_km):
+    radius_m = int(radius_km) * 1000
+    amenities = "|".join(LOCATION_CATEGORIES)
+    query = f"""
+    [out:json][timeout:25];
+    (
+      nwr["amenity"~"{amenities}"](around:{radius_m},{lat},{lon});
+      nwr["leisure"="dance"](around:{radius_m},{lat},{lon});
+      nwr["club"="music"](around:{radius_m},{lat},{lon});
+    );
+    out center tags 60;
+    """
+    payload = urllib.parse.urlencode({"data": query})
+    return http_json("https://overpass-api.de/api/interpreter", payload).get("elements", [])
+
+
+def location_category(tags):
+    value = tags.get("amenity") or tags.get("club") or tags.get("leisure") or "location"
+    return LOCATION_CATEGORIES.get(value, "Location")
+
+
+def location_address(tags):
+    parts = [
+        " ".join(part for part in (tags.get("addr:street"), tags.get("addr:housenumber")) if part),
+        tags.get("addr:postcode", ""),
+        tags.get("addr:city", ""),
+    ]
+    return ", ".join(part for part in parts if part)
+
+
+def estimate_location_details(tags, category):
+    name_blob = " ".join(
+        value.lower()
+        for key, value in tags.items()
+        if key in ("name", "description", "amenity", "club", "leisure", "cuisine")
+    )
+    if any(word in name_blob for word in ("rock", "punk", "metal", "musik", "music", "live", "club")):
+        genre = "Rock, Punk, Alternative oder Live-Musik wahrscheinlich passend."
+    elif category in ("Kneipe", "Bar", "Biergarten"):
+        genre = "Akustik, Folk, Rock'n'Roll oder kleine Band-Sets wahrscheinlich passend."
+    elif "Jugend" in category or "Kultur" in category:
+        genre = "Alternative, Punk, Rock und lokale Kulturveranstaltungen wahrscheinlich passend."
+    elif category in ("Theater", "Veranstaltungsort"):
+        genre = "Bühnenprogramm, Akustik oder Kulturabend wahrscheinlich passend."
+    else:
+        genre = "Musikrichtung offen, vorher Programm und Veranstaltungsprofil prüfen."
+
+    capacity_tag = tags.get("capacity")
+    if capacity_tag:
+        capacity = f"ca. {capacity_tag} Personen laut Web-Daten."
+    elif category in ("Kneipe", "Bar", "Cafe"):
+        capacity = "geschätzt 30-120 Personen."
+    elif "Jugend" in category or "Kultur" in category:
+        capacity = "geschätzt 80-250 Personen."
+    elif category in ("Club", "Musikclub", "Veranstaltungsort"):
+        capacity = "geschätzt 150-500 Personen."
+    else:
+        capacity = "Kapazität unbekannt, telefonisch oder per Mail klären."
+
+    info = []
+    for key, label in (
+        ("opening_hours", "Öffnungszeiten"),
+        ("phone", "Telefon"),
+        ("email", "E-Mail"),
+        ("operator", "Betreiber"),
+    ):
+        if tags.get(key):
+            info.append(f"{label}: {tags[key]}")
+    if not info:
+        info.append("Programm, Technik, Bühne und Booking-Kontakt prüfen.")
+
+    return genre, capacity, " | ".join(info)
+
+
+def normalize_location_result(element):
+    tags = element.get("tags", {})
+    name = tags.get("name")
+    if not name:
+        return None
+    category = location_category(tags)
+    lat = element.get("lat") or element.get("center", {}).get("lat")
+    lon = element.get("lon") or element.get("center", {}).get("lon")
+    if lat is None or lon is None:
+        return None
+    genre, capacity, info = estimate_location_details(tags, category)
+    osm_id = f'{element.get("type", "node")}/{element.get("id")}'
+    website = tags.get("website") or tags.get("contact:website") or tags.get("url") or ""
+    return {
+        "osm_id": osm_id,
+        "name": name,
+        "category": category,
+        "address": location_address(tags),
+        "website": normalize_url(website) if website else "",
+        "lat": float(lat),
+        "lon": float(lon),
+        "genre_hint": genre,
+        "capacity_hint": capacity,
+        "info": info,
+    }
+
+
+def search_locations(filters):
+    place = filter_value(filters, "place")
+    radius = filter_value(filters, "radius", "10")
+    if radius not in ("10", "25", "50"):
+        radius = "10"
+    if not place:
+        return [], "", ""
+    try:
+        geo = geocode_place(place)
+        if geo is None:
+            return [], "", "Der Ort oder die PLZ wurde nicht gefunden."
+        raw_results = overpass_location_search(geo["lat"], geo["lon"], radius)
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return [], "", "Die Web-Suche ist gerade nicht erreichbar. Bitte später erneut versuchen."
+
+    results = []
+    seen = set()
+    favorite_ids = {row["osm_id"] for row in list_favorite_locations()}
+    for element in raw_results:
+        result = normalize_location_result(element)
+        if result is None or result["osm_id"] in seen:
+            continue
+        seen.add(result["osm_id"])
+        result["is_favorite"] = result["osm_id"] in favorite_ids
+        results.append(result)
+    results.sort(key=lambda item: (item["category"], item["name"].lower()))
+    return results[:40], geo["label"], ""
+
+
+def list_favorite_locations():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT *
+            FROM favorite_locations
+            ORDER BY created_at DESC, name
+            """
+        ).fetchall()
+
+
+def save_favorite_location(form):
+    data = {
+        "osm_id": field_value(form, "osm_id"),
+        "name": field_value(form, "name"),
+        "category": field_value(form, "category"),
+        "address": field_value(form, "address"),
+        "website": normalize_url(field_value(form, "website")),
+        "lat": field_value(form, "lat"),
+        "lon": field_value(form, "lon"),
+        "genre_hint": field_value(form, "genre_hint"),
+        "capacity_hint": field_value(form, "capacity_hint"),
+        "info": field_value(form, "info"),
+    }
+    if not data["osm_id"] or not data["name"]:
+        return False
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO favorite_locations (
+                osm_id, name, category, address, website, lat, lon,
+                genre_hint, capacity_hint, info
+            ) VALUES (
+                :osm_id, :name, :category, :address, :website, :lat, :lon,
+                :genre_hint, :capacity_hint, :info
+            )
+            ON CONFLICT(osm_id) DO UPDATE SET
+                name = excluded.name,
+                category = excluded.category,
+                address = excluded.address,
+                website = excluded.website,
+                lat = excluded.lat,
+                lon = excluded.lon,
+                genre_hint = excluded.genre_hint,
+                capacity_hint = excluded.capacity_hint,
+                info = excluded.info
+            """,
+            data,
+        )
+    return True
+
+
+def delete_favorite_location(form):
+    favorite_id = field_value(form, "id")
+    if not favorite_id.isdigit():
+        return False
+    with get_connection() as connection:
+        cursor = connection.execute("DELETE FROM favorite_locations WHERE id = ?", (favorite_id,))
+    return cursor.rowcount == 1
+
+
 def selected(current, value):
     return " selected" if (current or "") == value else ""
 
@@ -743,9 +1000,148 @@ def render_availability_entry(row):
     """
 
 
+def hidden_location_fields(result):
+    return "\n".join(
+        f'<input type="hidden" name="{key}" value="{escape(str(result.get(key, "")))}">'
+        for key in (
+            "osm_id",
+            "name",
+            "category",
+            "address",
+            "website",
+            "lat",
+            "lon",
+            "genre_hint",
+            "capacity_hint",
+            "info",
+        )
+    )
+
+
+def render_location_result(result):
+    website = result.get("website", "")
+    website_link = (
+        f'<a class="text-link" href="{escape(website)}" target="_blank" rel="noreferrer">Webseite öffnen</a>'
+        if website
+        else ""
+    )
+    maps_query = quote_plus(f'{result["lat"]},{result["lon"]}')
+    maps_link = f'<a class="text-link" href="https://www.google.com/maps/search/?api=1&query={maps_query}" target="_blank" rel="noreferrer">In Maps öffnen</a>'
+    star_label = "Favorit" if result.get("is_favorite") else "Als Favorit merken"
+    star_class = "star-button active" if result.get("is_favorite") else "star-button"
+    return f"""
+    <article class="location-card">
+        <div class="location-card-header">
+            <div>
+                <p class="type">{escape(result["category"])}</p>
+                <h3>{escape(result["name"])}</h3>
+            </div>
+            <form method="post" action="/locations/favorite" class="inline-form">
+                {hidden_location_fields(result)}
+                <button type="submit" class="{star_class}" title="{star_label}">★</button>
+            </form>
+        </div>
+        <dl class="meta">
+            <div><dt>Adresse</dt><dd>{escape(result["address"] or "Adresse unbekannt")}{maps_link}</dd></div>
+            <div><dt>Musikrichtung</dt><dd>{escape(result["genre_hint"])}</dd></div>
+            <div><dt>Kapazität</dt><dd>{escape(result["capacity_hint"])}</dd></div>
+        </dl>
+        <p class="notes">{escape(result["info"])}</p>
+        {website_link}
+    </article>
+    """
+
+
+def render_favorite_location(row):
+    maps_query = quote_plus(f'{row["lat"]},{row["lon"]}')
+    website_link = (
+        f'<a class="text-link" href="{escape(row["website"])}" target="_blank" rel="noreferrer">Webseite öffnen</a>'
+        if row["website"]
+        else ""
+    )
+    return f"""
+    <article class="favorite-location">
+        <div>
+            <p class="type">{escape(row["category"] or "Location")}</p>
+            <h3>{escape(row["name"])}</h3>
+            <p>{escape(row["address"] or "Adresse unbekannt")}</p>
+            <p>{escape(row["capacity_hint"] or "Kapazität unbekannt")}</p>
+            <a class="text-link" href="https://www.google.com/maps/search/?api=1&query={maps_query}" target="_blank" rel="noreferrer">In Maps öffnen</a>
+            {website_link}
+        </div>
+        <form method="post" action="/locations/favorite/delete" class="inline-form">
+            <input type="hidden" name="id" value="{escape(str(row["id"]))}">
+            <button type="submit" class="danger-button">Entfernen</button>
+        </form>
+    </article>
+    """
+
+
+def render_location_finder_section(filters, message=""):
+    active_class = " active" if filter_value(filters, "tab", "concerts") == "locations" else ""
+    place = filter_value(filters, "place")
+    radius = filter_value(filters, "radius", "10")
+    results, resolved_place, error = search_locations(filters) if active_class else ([], "", "")
+    favorites = list_favorite_locations()
+    result_cards = "\n".join(render_location_result(result) for result in results)
+    favorite_cards = "\n".join(render_favorite_location(row) for row in favorites)
+    safe_message = f'<p class="message">{escape(message)}</p>' if message and active_class else ""
+    result_status = ""
+    if error:
+        result_status = f'<p class="message">{escape(error)}</p>'
+    elif place:
+        result_status = f'<p class="location-status">{len(results)} Treffer rund um {escape(resolved_place)}.</p>'
+    elif not active_class:
+        result_status = ""
+    else:
+        result_status = '<p class="summary-empty">Gib eine Stadt oder PLZ ein und starte die Suche.</p>'
+
+    return f"""
+    <section class="panel location-finder tab-pane{active_class}" aria-labelledby="location-finder-title">
+        <div class="section-heading">
+            <div>
+                <p class="eyebrow">Recherche</p>
+                <h2 id="location-finder-title">Locations finden</h2>
+            </div>
+        </div>
+        <form method="get" action="/" class="location-search-form">
+            <input type="hidden" name="tab" value="locations">
+            <label>
+                Stadt oder PLZ
+                <input name="place" value="{escape(place)}" placeholder="z. B. Duisburg, 47119">
+            </label>
+            <label>
+                Umkreis
+                <select name="radius">
+                    {option("10", radius, "10 km")}
+                    {option("25", radius, "25 km")}
+                    {option("50", radius, "50 km")}
+                </select>
+            </label>
+            <button type="submit">Suchen</button>
+        </form>
+        {safe_message}
+        <div class="location-layout">
+            <div>
+                <h3>Suchergebnisse</h3>
+                {result_status}
+                <div class="location-results">{result_cards}</div>
+            </div>
+            <aside class="favorite-locations" aria-label="Favorisierte Locations">
+                <h3>Favoriten</h3>
+                <div class="favorite-list">
+                    {favorite_cards if favorite_cards else '<p class="summary-empty">Noch keine Favoriten markiert.</p>'}
+                </div>
+            </aside>
+        </div>
+    </section>
+    """
+
+
 def render_tabs(active_tab, current_user=None):
     concerts_class = "active" if active_tab == "concerts" else ""
     calendar_class = "active" if active_tab == "calendar" else ""
+    locations_class = "active" if active_tab == "locations" else ""
     admin_link = ""
     if current_user and current_user["role"] == "admin":
         admin_class = "active" if active_tab == "admin" else ""
@@ -754,6 +1150,7 @@ def render_tabs(active_tab, current_user=None):
     <nav class="tabs" aria-label="Hauptbereiche">
         <a class="{concerts_class}" href="/?tab=concerts">Konzerteinträge</a>
         <a class="{calendar_class}" href="/?tab=calendar#calendar">Kalender</a>
+        <a class="{locations_class}" href="/?tab=locations">Location-Suche</a>
         {admin_link}
     </nav>
     """
@@ -881,7 +1278,7 @@ def render_admin_page(current_user, message=""):
 def render_page(message="", edit_row=None, filters=None, current_user=None):
     filters = filters or {}
     active_tab = filter_value(filters, "tab", "concerts")
-    if active_tab not in ("concerts", "calendar"):
+    if active_tab not in ("concerts", "calendar", "locations"):
         active_tab = "concerts"
     if edit_row is not None:
         active_tab = "concerts"
@@ -1047,6 +1444,7 @@ def render_page(message="", edit_row=None, filters=None, current_user=None):
             <div class="cards">{cards}</div>
         </section>
         {render_availability_section(filters)}
+        {render_location_finder_section(filters, message)}
     </main>
 </body>
 </html>"""
@@ -1157,6 +1555,8 @@ class BookingHandler(BaseHTTPRequestHandler):
                 "deleted": "Eintrag gelöscht.",
                 "availability": "Verfügbarkeit eingetragen.",
                 "availability-deleted": "Verfügbarkeit gelöscht.",
+                "favorite": "Location als Favorit gespeichert.",
+                "favorite-deleted": "Favorit entfernt.",
             }
             message = messages.get(query.get("saved", [""])[0], "")
             self.respond(render_page(message, filters=query, current_user=current_user), "text/html; charset=utf-8")
@@ -1235,6 +1635,20 @@ class BookingHandler(BaseHTTPRequestHandler):
                 self.redirect(f"/?tab=calendar&saved=availability-deleted{month_query}#calendar")
                 return
             self.respond(render_page("Die Verfügbarkeit konnte nicht gelöscht werden.", current_user=current_user), "text/html; charset=utf-8")
+            return
+
+        if path == "/locations/favorite":
+            if save_favorite_location(form):
+                self.redirect("/?tab=locations&saved=favorite")
+                return
+            self.respond(render_page("Die Location konnte nicht gespeichert werden.", current_user=current_user), "text/html; charset=utf-8")
+            return
+
+        if path == "/locations/favorite/delete":
+            if delete_favorite_location(form):
+                self.redirect("/?tab=locations&saved=favorite-deleted")
+                return
+            self.respond(render_page("Der Favorit konnte nicht entfernt werden.", current_user=current_user), "text/html; charset=utf-8")
             return
 
         self.send_error(HTTPStatus.NOT_FOUND)
@@ -1415,6 +1829,14 @@ h1 {
     margin: 0 0 22px;
     border-radius: 8px;
     background: #000000;
+}
+
+.auth-panel h1 {
+    font-size: clamp(2.2rem, 7vw, 3.4rem);
+}
+
+.auth-panel .intro {
+    color: var(--muted);
 }
 
 .user-bar {
@@ -1636,6 +2058,86 @@ button:hover,
 .availability-panel {
     grid-column: 1 / -1;
     padding: 22px;
+}
+
+.location-finder {
+    grid-column: 1 / -1;
+    padding: 22px;
+}
+
+.location-search-form {
+    display: grid;
+    grid-template-columns: minmax(220px, 1fr) minmax(130px, 180px) auto;
+    gap: 12px;
+    align-items: end;
+    margin: 18px 0 22px;
+}
+
+.location-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+    gap: 18px;
+    align-items: start;
+}
+
+.location-status {
+    margin: 10px 0 14px;
+    color: var(--muted);
+}
+
+.location-results,
+.favorite-list {
+    display: grid;
+    gap: 12px;
+}
+
+.location-card,
+.favorite-location {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    background: #fffdf7;
+}
+
+.location-card-header,
+.favorite-location {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+}
+
+.location-card h3,
+.favorite-location h3 {
+    margin: 0;
+}
+
+.star-button {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 0;
+    border-radius: 999px;
+    background: #e8eef2;
+    color: #4c3920;
+    font-size: 1.3rem;
+}
+
+.star-button.active,
+.star-button:hover {
+    background: #fbbf24;
+    color: #16110d;
+}
+
+.favorite-locations {
+    position: sticky;
+    top: 18px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+    background: #f7f1e8;
+}
+
+.favorite-locations h3 {
+    margin-top: 0;
 }
 
 .availability-panel .section-heading {
@@ -2047,11 +2549,13 @@ dd {
         grid-column: 1 / -1;
     }
 
-    .calendar-layout {
+    .calendar-layout,
+    .location-layout {
         grid-template-columns: 1fr;
     }
 
-    .availability-summary {
+    .availability-summary,
+    .favorite-locations {
         position: static;
     }
 }
@@ -2087,6 +2591,16 @@ dd {
     }
 
     .filter-actions {
+        flex-direction: column;
+    }
+
+    .location-search-form {
+        grid-template-columns: 1fr;
+    }
+
+    .location-card-header,
+    .favorite-location {
+        align-items: flex-start;
         flex-direction: column;
     }
 
